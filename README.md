@@ -134,16 +134,69 @@ If you don't want to install ALSA, simply omit the `audio` feature and the emula
 
 # Project Structure
 
-```
+```text
 src/
- ├── cpu.rs
- ├── tia.rs
- ├── riot.rs
- ├── cartridge.rs
- ├── audio.rs
- ├── bus.rs
- ├── main.rs
+├── main.rs
+├── console.rs
+├── cpu.rs
+├── bus.rs
+├── cartridge.rs
+├── tia.rs
+├── riot.rs
+├── input.rs
+└── audio.rs
 ```
+
+### Emulator Architecture
+
+```mermaid
+flowchart TD
+
+    MAIN["main.rs<br/>Application entry point"]
+
+    CONSOLE["console.rs<br/>Coordinates all emulator components"]
+
+    CPU["cpu.rs<br/>MOS 6507 CPU"]
+
+    BUS["bus.rs<br/>Memory bus"]
+
+    CART["cartridge.rs<br/>ROM & bank switching"]
+
+    TIA["tia.rs<br/>Graphics, video timing and audio registers"]
+
+    RIOT["riot.rs<br/>6532 RIOT<br/>RAM, timers and I/O"]
+
+    INPUT["input.rs<br/>Keyboard & joystick"]
+
+    AUDIO["audio.rs<br/>Audio backend"]
+
+    MAIN --> CONSOLE
+
+    CONSOLE --> CPU
+    CONSOLE --> TIA
+    CONSOLE --> RIOT
+    CONSOLE --> INPUT
+    CONSOLE --> AUDIO
+
+    CPU <--> BUS
+    BUS <--> CART
+    BUS <--> TIA
+    BUS <--> RIOT
+```
+
+### Module Overview
+
+| File | Purpose |
+|------|---------|
+| **main.rs** | Entry point. Creates the window, parses command-line arguments, loads the ROM and runs the emulation loop. |
+| **console.rs** | High-level coordinator responsible for keeping all hardware components synchronized. |
+| **cpu.rs** | Full implementation of the MOS 6507 CPU, including instruction decoding and cycle execution. |
+| **bus.rs** | Routes every CPU memory access to the appropriate hardware component. |
+| **cartridge.rs** | Loads ROM images and implements cartridge bank-switching schemes. |
+| **tia.rs** | Emulates the Television Interface Adapter (TIA): video generation, sprites, playfield, collisions and audio registers. |
+| **riot.rs** | Emulates the MOS 6532 RIOT chip, providing RAM, timers and I/O registers. |
+| **input.rs** | Maps keyboard input to the Atari joystick and console switches. |
+| **audio.rs** | Generates audio output from the TIA audio registers. |
 
 ---
 
