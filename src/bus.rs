@@ -6,6 +6,7 @@ pub struct Bus {
     pub cart: Cartridge,
     pub input: Input,
     pub trace: bool,
+    pending_tia_writes: Vec<(u16, u8)>,
 }
 
 impl Bus {
@@ -17,10 +18,34 @@ impl Bus {
         }
     }
 
-    pub fn new(cart: Cartridge) -> Self { Self { tia: Tia::new(), riot: Riot::new(), cart, input: Input::new(), trace: false } }
+    pub fn new(cart: Cartridge) -> Self {
+        Self {
+            tia: Tia::new(),
+            riot: Riot::new(),
+            cart,
+            input: Input::new(),
+            trace: false,
+            pending_tia_writes: Vec::with_capacity(4),
+        }
+    }
+
     pub fn tick(&mut self, cpu_cycles: u32) -> bool {
         self.riot.tick(cpu_cycles);
-        self.tia.tick(cpu_cycles)
+        let mut frame_ready = false;
+
+        // A maioria das escritas do 6507 ocorre no último ciclo da instrução.
+        // Adiá-las até esse ponto evita que o novo valor afete retroativamente
+        // todos os color clocks da instrução recém-executada.
+        for cycle in 0..cpu_cycles {
+            if cycle + 1 == cpu_cycles {
+                for (addr, val) in self.pending_tia_writes.drain(..) {
+                    self.tia.write(addr, val);
+                }
+            }
+            self.tia.tick_cpu_cycle();
+            frame_ready |= self.tia.take_frame_ready();
+        }
+        frame_ready
     }
 }
 
@@ -45,14 +70,14 @@ impl Memory for Bus {
     fn write(&mut self, addr: u16, val: u8) {
         let a = addr & 0x1fff;
         match a {
-            0x0000..=0x007f => { if self.trace { log::trace!("TIA WRITE ${:02X} <= ${:02X}", a & 0x3f, val); } self.tia.write(a, val) },
+            0x0000..=0x007f => { if self.trace { log::trace!("TIA WRITE ${:02X} <= ${:02X}", a & 0x3f, val); } self.pending_tia_writes.push((a, val)) },
             0x0080..=0x00ff => self.riot.write_ram(a, val),
-            0x0100..=0x017f => { if self.trace { log::trace!("TIA WRITE ${:02X} <= ${:02X}", a & 0x3f, val); } self.tia.write(a, val) },
+            0x0100..=0x017f => { if self.trace { log::trace!("TIA WRITE ${:02X} <= ${:02X}", a & 0x3f, val); } self.pending_tia_writes.push((a, val)) },
             0x0180..=0x01ff => self.riot.write_ram(a, val),
             0x0280..=0x029f => self.riot.write_io(a, val),
             0x1000..=0x1fff => self.cart.write(a, val),
             _ => match a & 0x1080 {
-                0x0000 => self.tia.write(a, val),
+                0x0000 => self.pending_tia_writes.push((a, val)),
                 0x0080 => self.riot.write_ram(a, val),
                 0x1000 => self.cart.write(a, val),
                 _ => {}

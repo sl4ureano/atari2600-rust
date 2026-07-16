@@ -179,6 +179,12 @@ impl Tia {
     }
 
 
+    pub fn take_frame_ready(&mut self) -> bool {
+        let ready = self.frame_ready;
+        self.frame_ready = false;
+        ready
+    }
+
     pub fn audio_state(&self) -> crate::audio::TiaAudioState {
         crate::audio::TiaAudioState {
             audc0: self.audc0, audf0: self.audf0, audv0: self.audv0,
@@ -289,20 +295,53 @@ impl Tia {
         }
     }
 
+    /// Avança a TIA em color clocks. Cada ciclo do 6507 corresponde a 3
+    /// color clocks da TIA. Ao contrário da versão anterior, cada pixel é
+    /// produzido no instante em que o feixe passa por ele; portanto escritas
+    /// em PFx/GRPx/COLUx durante a scanline afetam somente os pixels seguintes.
     pub fn tick(&mut self, cpu_cycles: u32) -> bool {
         self.frame_ready = false;
-        for _ in 0..cpu_cycles.saturating_mul(3) {
-            self.cycles_in_line += 1;
-            if self.cycles_in_line >= COLOR_CLOCKS_PER_LINE {
-                self.end_scanline();
-            }
+        for _ in 0..cpu_cycles {
+            self.tick_cpu_cycle();
         }
         self.frame_ready
     }
 
-    fn force_next_scanline(&mut self) {
-        if self.cycles_in_line != 0 {
+    pub fn tick_cpu_cycle(&mut self) {
+        for _ in 0..3 {
+            self.tick_color_clock();
+        }
+    }
+
+    fn tick_color_clock(&mut self) {
+        let clock = self.cycles_in_line;
+
+        if !self.vsync && !self.vblank
+            && clock >= self.visible_start_clock
+            && clock < self.visible_start_clock + VISIBLE_WIDTH
+        {
+            let x = clock - self.visible_start_clock;
+            if self.visible_y >= self.y_crop {
+                let y = self.visible_y - self.y_crop;
+                if y < VISIBLE_HEIGHT {
+                    self.render_pixel(x, y);
+                    self.had_visible_lines = true;
+                }
+            }
+        }
+
+        self.cycles_in_line += 1;
+        if self.cycles_in_line >= COLOR_CLOCKS_PER_LINE {
             self.end_scanline();
+        }
+    }
+
+    fn force_next_scanline(&mut self) {
+        // WSYNC bloqueia o 6507 até o fim da scanline. Como a CPU deste
+        // projeto ainda trabalha por instrução, consumimos aqui os color
+        // clocks restantes para preservar o conteúdo já desenhado na linha.
+        while self.cycles_in_line != 0 {
+            self.tick_color_clock();
         }
     }
 
@@ -310,10 +349,6 @@ impl Tia {
         self.cycles_in_line = 0;
 
         if !self.vsync && !self.vblank {
-            if self.visible_y >= self.y_crop && (self.visible_y - self.y_crop) < VISIBLE_HEIGHT {
-                self.render_line(self.visible_y - self.y_crop);
-                self.had_visible_lines = true;
-            }
             self.visible_y += 1;
         }
 
@@ -323,6 +358,7 @@ impl Tia {
             if self.had_visible_lines {
                 self.publish_frame();
             }
+            self.clear_back();
             self.scanline = 0;
             self.visible_y = 0;
             self.had_visible_lines = false;
@@ -343,38 +379,41 @@ impl Tia {
         raw.rem_euclid(VISIBLE_WIDTH as isize) as usize
     }
 
-    fn render_line(&mut self, y: usize) {
-        for x in 0..VISIBLE_WIDTH {
-            let pf = self.playfield_bit(x);
-            let p0 = sprite_copies_bit(self.grp0, self.nusiz0, x, self.hpos_p0);
-            let p1 = sprite_copies_bit(self.grp1, self.nusiz1, x, self.hpos_p1);
-            let m0 = self.enam0 & 0x02 != 0 && missile_bit(self.nusiz0, x, self.hpos_m0);
-            let m1 = self.enam1 & 0x02 != 0 && missile_bit(self.nusiz1, x, self.hpos_m1);
-            let bl = self.enabl & 0x02 != 0 && x >= self.hpos_bl && x < self.hpos_bl.saturating_add(ball_width(self.ctrlpf));
+    fn render_pixel(&mut self, x: usize, y: usize) {
+        let pf = self.playfield_bit(x);
+        let p0 = sprite_copies_bit(self.grp0, self.nusiz0, x, self.hpos_p0);
+        let p1 = sprite_copies_bit(self.grp1, self.nusiz1, x, self.hpos_p1);
+        let m0 = self.enam0 & 0x02 != 0 && missile_bit(self.nusiz0, x, self.hpos_m0);
+        let m1 = self.enam1 & 0x02 != 0 && missile_bit(self.nusiz1, x, self.hpos_m1);
+        let bl = self.enabl & 0x02 != 0
+            && x >= self.hpos_bl
+            && x < self.hpos_bl.saturating_add(ball_width(self.ctrlpf));
 
-            self.latch_collisions(p0, p1, m0, m1, bl, pf);
+        self.latch_collisions(p0, p1, m0, m1, bl, pf);
 
-            let score_mode = self.ctrlpf & 0x02 != 0;
-            let priority_pf = self.ctrlpf & 0x04 != 0;
+        let score_mode = self.ctrlpf & 0x02 != 0;
+        let priority_pf = self.ctrlpf & 0x04 != 0;
 
-            let mut c = self.color_bg;
-            if pf || bl {
-                c = if score_mode && x < 80 { self.color_p0 } else if score_mode { self.color_p1 } else { self.color_pf };
-            }
-
-            if !priority_pf {
-                if p0 || m0 { c = self.color_p0; }
-                if p1 || m1 { c = self.color_p1; }
-            } else if p0 || m0 || p1 || m1 {
-                // Com prioridade ligada, playfield/ball ficam na frente. Players aparecem só onde não há PF/ball.
-                if !(pf || bl) {
-                    if p0 || m0 { c = self.color_p0; }
-                    if p1 || m1 { c = self.color_p1; }
-                }
-            }
-
-            self.put_px(x, y, c);
+        let mut c = self.color_bg;
+        if pf || bl {
+            c = if score_mode && x < 80 {
+                self.color_p0
+            } else if score_mode {
+                self.color_p1
+            } else {
+                self.color_pf
+            };
         }
+
+        if !priority_pf {
+            if p0 || m0 { c = self.color_p0; }
+            if p1 || m1 { c = self.color_p1; }
+        } else if !(pf || bl) {
+            if p0 || m0 { c = self.color_p0; }
+            if p1 || m1 { c = self.color_p1; }
+        }
+
+        self.put_px(x, y, c);
     }
 
     fn playfield_bit(&self, x: usize) -> bool {
